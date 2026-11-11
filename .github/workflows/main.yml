@@ -1,0 +1,82 @@
+name: Build VRA APK from ZIP
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip project
+        run: |
+          ls -la
+          ZIP=$(find . -maxdepth 2 -type f -iname "*project*" -not -path "./.git/*" -not -path "./.github/*" -not -name "*.yml" | head -n 1)
+          echo "Using: $ZIP"
+          unzip -q -o "$ZIP" -d project
+          ls project
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Android scaffold
+        working-directory: project/frontend
+        run: flutter create --org dev.vra --project-name vra --platforms android .
+      - name: Apply VRA native layer
+        working-directory: project/frontend
+        run: |
+          APP=android/app/src/main
+          rm -rf $APP/kotlin/*
+          mkdir -p $APP/kotlin/dev/vra/app
+          cp android_overlay/MainActivity.kt $APP/kotlin/dev/vra/app/
+          cp -r ../android_host/kotlin/dev/vra/host $APP/kotlin/dev/vra/
+          cp android_overlay/AndroidManifest.xml $APP/AndroidManifest.xml
+          cp -r android_overlay/res/* $APP/res/
+          rm -f test/widget_test.dart
+          sed -i 's/applicationId = ".*"/applicationId = "dev.vra.app"/; s/namespace = ".*"/namespace = "dev.vra.app"/' android/app/build.gradle* || true
+      - name: Download and package QEMU
+        working-directory: project/frontend
+        run: python3 ../virtualization_engine/fetch_qemu.py android/app/src/main
+      - name: Download test guest kernel (Alpine Linux, aarch64)
+        working-directory: project/frontend
+        run: |
+          A=android/app/src/main/assets
+          mkdir -p $A
+          curl -fL -o $A/vmlinuz-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/netboot/vmlinuz-virt
+          curl -fL -o $A/initramfs-virt https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/netboot/initramfs-virt
+          ls -la $A
+      - name: Build guest root filesystem (Alpine minirootfs)
+        working-directory: project/frontend
+        run: |
+          A=android/app/src/main/assets
+          BASE=https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64
+          curl -fL -o latest.yaml $BASE/latest-releases.yaml
+          FILE=$(grep -o 'alpine-minirootfs-[0-9.]*-aarch64.tar.gz' latest.yaml | head -n 1)
+          echo "Using $FILE"
+          curl -fL -o minirootfs.tar.gz $BASE/$FILE
+          mkdir rootfs
+          sudo tar -xzf minirootfs.tar.gz -C rootfs --numeric-owner
+          sudo cp ../virtualization_engine/guest_init.sh rootfs/init
+          sudo chmod 755 rootfs/init
+          (cd rootfs && sudo find . | sudo cpio -o -H newc --quiet) | gzip -9 > $A/initramfs-vra
+          ls -la $A
+      - name: Allow native libs to be extracted
+        working-directory: project/frontend
+        run: |
+          sed -i '0,/^android {/s//android {\n    packaging { jniLibs { useLegacyPackaging = true } }/' android/app/build.gradle*
+          grep -n "useLegacyPackaging" android/app/build.gradle*
+      - run: flutter pub get
+        working-directory: project/frontend
+      - name: Unit tests
+        run: flutter test
+        working-directory: project/frontend
+      - name: Build release APK (arm64)
+        run: flutter build apk --release --target-platform android-arm64
+        working-directory: project/frontend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vra-release-apk
+          path: project/frontend/build/app/outputs/flutter-apk/app-release.apk
